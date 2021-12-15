@@ -1,0 +1,3 @@
+The client sits on the hostNetwork of a host makes an outbound connection with the tunnel server. The tunnel server can now do `net.Dial` on the client and pipe all bytes back and forth.
+
+Clients can also be configured to host multiple `httputil.ReverseProxy` that `net.Dial` requests will be forwarded to. These `httputil.ReverseProxy` instances can be configured to forward HTTP requests as HTTPS via a provided TLS config that grabs certificates from the host.
