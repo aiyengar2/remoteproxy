@@ -1,7 +1,289 @@
 #!/bin/bash
 set -e
 
+source $(dirname $0)/version
+
 cd $(dirname $0)/..
+
+# Ensure curl > 7.52.0 so that it supports HTTPS proxies
+curl_version=$(curl --version | cut -d' ' -f2 | head -n 1)
+if [[ $(echo ${curl_version} | cut -d"." -f1) < 7 ]]; then
+    echo "curl must be >7.52.0, found ${curl_version}"
+    exit 1
+fi
+if [[ $(echo ${curl_version} | cut -d"." -f2) < 52 ]]; then
+    echo "curl must be >7.52.0, found ${curl_version}"
+    exit 1
+fi
+
+if [[ -z ${REPO} ]] || [[ -z ${TAG} ]]; then
+    echo "Usage: REPO=aiyengar2 TAG=dev ./scripts/test"
+    exit 1
+fi
 
 echo Running tests
 go test -cover -tags=test ./...
+
+echo ""
+
+trap 'cleanup' EXIT
+
+cleanup() {
+    # Execute all cleanup even if there is failures
+    echo ""
+    echo "Cleaning up..."
+    set +e
+
+    for docker_service in target-service gateway proxy; do
+        for proto in http https mtls; do
+            echo "Removing ${proto}-${docker_service}..."
+            docker stop ${proto}-${docker_service} 1>/dev/null 2>/dev/null
+            docker rm ${proto}-${docker_service} 1>/dev/null 2>/dev/null
+        done
+    done
+
+    rm -rf ./bin/certs
+}
+
+IMAGE=${REPO}/portexporter:${TAG}
+
+## HTTP
+
+# Create a dummy HTTP service at port 8081
+docker run -d --name http-target-service ${IMAGE} test --listen ':8081' --debug 1>/dev/null
+
+# Create the HTTP proxy container and bind the proxy listen port to localhost:8000
+# This simulates a "public" URL that provides access to the proxy since containers
+# can access host ports via host.docker.internal (in newer versions of Docker)
+docker run -d --name http-proxy -p 8000:80 ${IMAGE} proxy --listen ':80' --debug 1>/dev/null
+
+# Add a gateway container that shares the same networking stack as the container running the dummy service but tries
+# to connect with the HTTP proxy located at the host network
+docker run -d --name http-gateway --net=container:http-target-service ${IMAGE} gateway --proxy-url "ws://host.docker.internal:8000/connect" --debug 1>/dev/null
+
+## Grab Target IP
+target_ip=$(docker inspect http-target-service | jq -r '.[0].NetworkSettings.IPAddress')
+
+## HTTPS
+
+# Create certs for the https-target-service / mtls-target-service
+echo "Generating self-signed certs to run proxy and target-service over HTTPS..."
+echo ""
+mkdir -p ./bin/certs/https-target-service
+docker run -v $(pwd)/bin/certs/https-target-service:/certs -e CA_SUBJECT="self-signed" -e SSL_SUBJECT="${target_ip}" -e SSL_IP="127.0.0.1,${target_ip}" superseb/omgwtfssl 1>/dev/null
+
+# Create certs for the https-proxy / mtls-proxy
+mkdir -p ./bin/certs/https-proxy
+docker run -v $(pwd)/bin/certs/https-proxy:/certs -e CA_SUBJECT="self-signed" -e SSL_SUBJECT="localhost" -e SSL_DNS="host.docker.internal" -e SSL_IP="127.0.0.1" superseb/omgwtfssl 1>/dev/null
+
+# Create a dummy HTTPS service at port 8082
+docker run -d --name https-target-service --net=container:http-target-service -v $(pwd)/bin/certs/https-target-service:/certs ${IMAGE} test --listen ':8082' --debug --cert-file '/certs/cert.pem' --key-file '/certs/key.pem' 1>/dev/null
+
+# Create a HTTPS proxy container and bind the proxy listen port to localhost:8001
+# This simulates a "public" URL that provides access to the proxy since containers
+# can access host ports via host.docker.internal (in newer versions of Docker)
+docker run -d --name https-proxy -p 8001:443 -v $(pwd)/bin/certs/https-proxy:/certs ${IMAGE} proxy --listen ':443' --debug --cert-file '/certs/cert.pem' --key-file '/certs/key.pem' 1>/dev/null
+
+# Add a gateway container that shares the same networking stack as the container running the dummy service but tries
+# to connect with the HTTPS proxy located at the host network
+docker run -d --name https-gateway --net=container:http-target-service -v $(pwd)/bin/certs/https-target-service:/certs ${IMAGE} gateway --proxy-url "wss://host.docker.internal:8001/connect" --debug --cacert-file '/certs/ca.pem' --insecure-skip-verify 1>/dev/null
+
+## Mutual TLS (HTTPS with client verification)
+
+# Reuse certs for mtls-target-service, mtls-proxy, and mtls-gateway
+cp -R ./bin/certs/https-target-service ./bin/certs/mtls-target-service
+cp -R ./bin/certs/https-proxy ./bin/certs/mtls-proxy
+
+# Create a dummy HTTPS service at port 8083 that enforces mutual TLS
+docker run -d --name mtls-target-service --net=container:http-target-service -v $(pwd)/bin/certs/mtls-target-service:/certs ${IMAGE} test --listen ':8083' --debug --cert-file '/certs/cert.pem' --key-file '/certs/key.pem' --cacert-file '/certs/ca.pem' 1>/dev/null
+
+# Create a HTTPS proxy container that enforces mutual TLS and bind the proxy listen port to localhost:8002
+# This simulates a "public" URL that provides access to the proxy since containers
+# can access host ports via host.docker.internal (in newer versions of Docker)
+docker run -d --name mtls-proxy -p 8002:443 -v $(pwd)/bin/certs/mtls-proxy:/certs ${IMAGE} proxy --listen ':443' --debug --cert-file '/certs/cert.pem' --key-file '/certs/key.pem' --cacert-file '/certs/ca.pem' 1>/dev/null
+
+# Add a gateway container that shares the same networking stack as the container running the dummy service but tries
+# to connect with the HTTPS proxy using mutual TLS located at the host network
+docker run -d --name mtls-gateway --net=container:http-target-service ${IMAGE} -v $(pwd)/bin/certs/mtls-target-service:/certs gateway --proxy-url "wss://host.docker.internal:8002/connect" --debug --cert-file '/certs/client-cert.pem' --key-file '/certs/client-key.pem' --cacert-file '/certs/ca.pem' --insecure-skip-verify 1>/dev/null
+
+# Collect logs
+
+echo_logs() {
+    if [[ -n ${log_since} ]]; then
+        since_arg="--since ${log_since}"
+    fi
+    log_since=$(date +%s)
+
+    for docker_service in target-service gateway proxy; do
+        for proto in http https mtls; do
+            echo ""
+            echo "${proto}-${docker_service} logs"
+            docker logs ${since_arg} ${proto}-${docker_service}
+        done
+    done
+}
+
+echo ""
+echo "Waiting for containers to initialize..."
+sleep 1
+echo_logs
+
+# Start running testing commands
+run_test() {
+    if [[ -z ${test_name} ]] || [[ -z ${cmd} ]] || [[ -z ${expect} ]]; then
+       echo "Error: expected test_name=${test_name}, cmd=${cmd}, and expect=${expect} to be set."
+       return
+    fi
+    set +e
+    output=$(eval ${cmd} 2>&1)
+    err_code=$?
+    set -e
+
+    echo "------------------------------------------------"
+    echo "${test_name}"
+    if [[ -n ${test_description} ]]; then
+    echo "${test_description}"
+    fi
+    echo ""
+    echo "$ ${cmd}"
+    if [[ -z ${output} ]]; then
+        echo "${output}"
+    fi
+    sleep 1
+
+    if [[ ${err_code} != 0 ]]; then
+        echo "FAILED: non-zero exit code ${err_code}"
+        echo_logs
+        echo ""
+        echo "------------------------------------------------"
+        return
+    fi
+
+    if [[ ${output} != ${expect} ]]; then
+        echo "FAILED: expected '${expect}' found '${output}'"
+        echo_logs
+        echo ""
+        echo "------------------------------------------------"
+        return
+    fi
+
+    echo ""
+    echo "PASSED"
+    echo_logs
+    echo ""
+    echo "------------------------------------------------"
+}
+
+http_target=http://${target_ip}:8081
+https_target=https://${target_ip}:8082
+mtls_target=https://${target_ip}:8083
+http_proxy=http://localhost:8000
+https_proxy=https://localhost:8001
+mtls_proxy=https://localhost:8002
+extra_curl_args="-s --connect-timeout 10 --max-time 300"
+
+echo ""
+echo "------------------------------------------------"
+echo "Integration Tests"
+
+## HTTP Proxy
+
+test_name="http->(http)->host"
+cmd="curl ${extra_curl_args} --proxy '${http_proxy}' ${http_target}"
+expect="hello"
+run_test
+
+test_name="https->(http)->host"
+cmd="curl ${extra_curl_args} --proxy '${http_proxy}' --cacert './bin/certs/https-target-service/ca.pem' ${https_target}"
+expect="hello"
+run_test
+
+test_name="mtls->(http)->host"
+cmd="curl ${extra_curl_args} --proxy '${http_proxy}' --cert './bin/certs/https-target-service/cert.pem' --key './bin/certs/https-target-service/key.pem' --cacert './bin/certs/https-target-service/ca.pem' ${mtls_target}"
+expect="hello"
+run_test
+
+### With Path
+
+test_name="http->(http)->host w/ path"
+cmd="curl ${extra_curl_args} --proxy '${http_proxy}' ${http_target}/world"
+expect="hello world"
+run_test
+
+test_name="https->(http)->host w/ path"
+cmd="curl ${extra_curl_args} --proxy '${http_proxy}' --cacert './bin/certs/https-target-service/ca.pem' ${https_target}/world"
+expect="hello world"
+run_test
+
+test_name="mtls->(http)->host w/ path"
+cmd="curl ${extra_curl_args} --proxy '${http_proxy}' --cert './bin/certs/https-target-service/cert.pem' --key './bin/certs/https-target-service/key.pem' --cacert './bin/certs/https-target-service/ca.pem' ${mtls_target}/world"
+expect="hello world"
+run_test
+
+## HTTPS Proxy
+
+test_name="http->(https)->host"
+cmd="curl ${extra_curl_args} --proxy '${https_proxy}' --proxy-cacert './bin/certs/https-proxy/ca.pem' ${http_target}"
+expect="hello"
+run_test
+
+test_name="https->(https)->host"
+cmd="curl ${extra_curl_args} --proxy '${https_proxy}' --proxy-cacert './bin/certs/https-proxy/ca.pem' --cacert './bin/certs/https-target-service/ca.pem' ${https_target}"
+expect="hello"
+run_test
+
+test_name="mtls->(https)->host"
+cmd="curl ${extra_curl_args} --proxy '${https_proxy}' --proxy-cacert './bin/certs/https-proxy/ca.pem' --cert './bin/certs/https-target-service/cert.pem' --key './bin/certs/https-target-service/key.pem' --cacert './bin/certs/https-target-service/ca.pem' ${mtls_target}"
+expect="hello"
+run_test
+
+### With Path
+
+test_name="http->(https)->host w/ path"
+cmd="curl ${extra_curl_args} --proxy '${https_proxy}' --proxy-cacert './bin/certs/https-proxy/ca.pem' ${http_target}/world"
+expect="hello world"
+run_test
+
+test_name="https->(https)->host w/ path"
+cmd="curl ${extra_curl_args} --proxy '${https_proxy}' --proxy-cacert './bin/certs/https-proxy/ca.pem' --cacert './bin/certs/https-target-service/ca.pem' ${https_target}/world"
+expect="hello world"
+run_test
+
+test_name="mtls->(https)->host w/ path"
+cmd="curl ${extra_curl_args} --proxy '${https_proxy}' --proxy-cacert './bin/certs/https-proxy/ca.pem' --cert './bin/certs/https-target-service/cert.pem' --key './bin/certs/https-target-service/key.pem' --cacert './bin/certs/https-target-service/ca.pem' ${mtls_target}/world"
+expect="hello world"
+run_test
+
+## MTLS Proxy
+
+test_name="http->(mtls)->host"
+cmd="curl ${extra_curl_args} --proxy '${mtls_proxy}' --proxy-cert './bin/certs/https-proxy/cert.pem' --proxy-key './bin/certs/https-proxy/key.pem' --proxy-cacert './bin/certs/https-proxy/ca.pem' ${http_target}"
+expect="hello"
+run_test
+
+test_name="https->(mtls)->host"
+cmd="curl ${extra_curl_args} --proxy '${mtls_proxy}' --proxy-cert './bin/certs/https-proxy/cert.pem' --proxy-key './bin/certs/https-proxy/key.pem' --proxy-cacert './bin/certs/https-proxy/ca.pem' --cacert './bin/certs/https-target-service/ca.pem' ${https_target}"
+expect="hello"
+run_test
+
+test_name="mtls->(mtls)->host"
+cmd="curl ${extra_curl_args} --proxy '${mtls_proxy}' --proxy-cert './bin/certs/https-proxy/cert.pem' --proxy-key './bin/certs/https-proxy/key.pem' --proxy-cacert './bin/certs/https-proxy/ca.pem' --cert './bin/certs/https-target-service/cert.pem' --key './bin/certs/https-target-service/key.pem' --cacert './bin/certs/https-target-service/ca.pem' ${mtls_target}"
+expect="hello"
+run_test
+
+### With Path
+
+test_name="http->(mtls)->host w/ path"
+cmd="curl ${extra_curl_args} --proxy '${mtls_proxy}' --proxy-cert './bin/certs/https-proxy/cert.pem' --proxy-key './bin/certs/https-proxy/key.pem' --proxy-cacert './bin/certs/https-proxy/ca.pem' ${http_target}/world"
+expect="hello world"
+run_test
+
+test_name="https->(mtls)->host w/ path"
+cmd="curl ${extra_curl_args} --proxy '${mtls_proxy}' --proxy-cert './bin/certs/https-proxy/cert.pem' --proxy-key './bin/certs/https-proxy/key.pem' --proxy-cacert './bin/certs/https-proxy/ca.pem' --cacert './bin/certs/https-target-service/ca.pem' ${https_target}/world"
+expect="hello world"
+run_test
+
+test_name="mtls->(mtls)->host w/ path"
+cmd="curl ${extra_curl_args} --proxy '${mtls_proxy}' --proxy-cert './bin/certs/https-proxy/cert.pem' --proxy-key './bin/certs/https-proxy/key.pem' --proxy-cacert './bin/certs/https-proxy/ca.pem' --cert './bin/certs/https-target-service/cert.pem' --key './bin/certs/https-target-service/key.pem' --cacert './bin/certs/https-target-service/ca.pem' ${mtls_target}/world"
+expect="hello world"
+run_test

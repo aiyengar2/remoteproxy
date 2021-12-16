@@ -4,3 +4,8 @@
 /dist
 *.swp
 .idea
+port-exporter
+redirect.yaml
+gateway.yaml
+proxy.yaml
+Docker.dapper?*

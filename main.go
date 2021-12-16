@@ -8,10 +8,10 @@ import (
 	"fmt"
 	"os"
 
-	_ "embed"
-
-	"github.com/aiyengar2/portexporter/cmd/client"
-	"github.com/aiyengar2/portexporter/cmd/server"
+	"github.com/aiyengar2/portexporter/cmd/gateway"
+	"github.com/aiyengar2/portexporter/cmd/proxy"
+	"github.com/aiyengar2/portexporter/cmd/redirector"
+	"github.com/aiyengar2/portexporter/cmd/test"
 	"github.com/sirupsen/logrus"
 	"github.com/urfave/cli"
 )
@@ -55,11 +55,10 @@ func main() {
 	}
 
 	app.Commands = []cli.Command{
-		// server
-		server.NewCommand(),
-
-		// cli
-		client.NewCommand(),
+		gateway.NewCommand(),
+		proxy.NewCommand(),
+		redirector.NewCommand(),
+		test.NewCommand(),
 	}
 
 	if err := app.Run(os.Args); err != nil {

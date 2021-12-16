@@ -6,10 +6,9 @@ import (
 
 func NewCommand() cli.Command {
 	return cli.Command{
-		Name:    "proxy",
-		Aliases: []string{"proxy"},
-		Usage:   "Creates a proxy that listens for registering gateways and proxies incoming requests to the corresponding gateways",
-		Action:  run,
-		Flags:   runFlags,
+		Name:   "proxy",
+		Usage:  "Proxies incoming HTTP(s) requests to registered Gateways",
+		Action: run,
+		Flags:  runFlags,
 	}
 }

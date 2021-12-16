@@ -1,13 +1,17 @@
 portexporter
 ========
 
-A tunnel server and reverse proxy client that are powered by [rancher/remotedialer](https://github.com/rancher/remotedialer).
+An HTTP(S) Proxy that registers one or more Gateways across a network boundary and proxies requests to those Gateways, powered by [rancher/remotedialer](https://github.com/rancher/remotedialer).
 
-The client is placed in the hostNetwork of a host and makes an outbound connection with the tunnel server.
+It is expected that the network on which a Gateway is deployed is capable of starting an **outbound** connection with the Proxy; however, the Gateway itself can be behind a network boundary.
 
-The tunnel server is placed in its own network and can now do `net.Dial` on the client and pipe all bytes back and forth.
+The Gateway also supports a `/proxy/{address}` HTTPS endpoint that will interpret incoming HTTPS requests, parse the provided address, and see if a proxy has been configured for it. If so, it will forward the request using a pre-configured `http.Transport` (optionally containing a `tls.Config`). On forwarding a request, it can also modify the request in flight (e.g. adding or removing headers, such as Bearer Auth tokens) if necessary.
 
-The client can also initialize multiple `httputil.ReverseProxy` that `net.Dial` requests will be forwarded to; this allows HTTP requests proxied via the tunnel server to optionally utilize client certificates to access a HTTPS service on the hostNetwork.
+### Use Cases
+
+The primary use case for this project is to enable querying the loopback address networks of multiple hosts behind a network boundary via a proxy.
+
+An example of such a use case would be to enable Prometheus to securely scrape metrics from hosts whose ports are cordoned off by network firewalls.
 
 ## Building
 

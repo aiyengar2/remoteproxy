@@ -12,7 +12,6 @@ fi
 LINKFLAGS="-X github.com/rancher/portexporter.Version=$VERSION"
 LINKFLAGS="-X github.com/rancher/portexporter.GitCommit=$COMMIT $LINKFLAGS"
 CGO_ENABLED=0 go build -ldflags "$LINKFLAGS $OTHER_LINKFLAGS" -o bin/portexporter
-if [ "$CROSS" = "true" ] && [ "$ARCH" = "amd64" ]; then
-    GOOS=darwin go build -ldflags "$LINKFLAGS" -o bin/portexporter-darwin
-    GOOS=windows go build -ldflags "$LINKFLAGS" -o bin/portexporter-windows
-fi
+GOOS=linux go build -ldflags "$LINKFLAGS" -o bin/portexporter-linux
+GOOS=darwin go build -ldflags "$LINKFLAGS" -o bin/portexporter-darwin
+GOOS=windows go build -ldflags "$LINKFLAGS" -o bin/portexporter-windows
